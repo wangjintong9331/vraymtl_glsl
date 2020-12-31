@@ -2072,8 +2072,95 @@ void initPresetParams(inout VRayMtlInitParams initParams, float sweepFactor) {
 	}
 }
 
+//Texture normal
+vec3 textureAVG(samplerCube tex, vec3 tc) {
+    const float diff0 = 0.35;
+    const float diff1 = 0.12;
+ 	vec3 s0 = texture(tex,tc).xyz;
+    vec3 s1 = texture(tex,tc+vec3(diff0)).xyz;
+    vec3 s2 = texture(tex,tc+vec3(-diff0)).xyz;
+    vec3 s3 = texture(tex,tc+vec3(-diff0,diff0,-diff0)).xyz;
+    vec3 s4 = texture(tex,tc+vec3(diff0,-diff0,diff0)).xyz;
+    
+    vec3 s5 = texture(tex,tc+vec3(diff1)).xyz;
+    vec3 s6 = texture(tex,tc+vec3(-diff1)).xyz;
+    vec3 s7 = texture(tex,tc+vec3(-diff1,diff1,-diff1)).xyz;
+    vec3 s8 = texture(tex,tc+vec3(diff1,-diff1,diff1)).xyz;
+    
+    return (s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8) * 0.111111111;
+}
+float somestep(float t)
+{
+    return pow(t, 4.0);
+}
+vec3 textureBlured(samplerCube tex, vec3 tc) {
+   	vec3 r = textureAVG(tex,vec3(1.0,0.0,0.0));
+    vec3 t = textureAVG(tex,vec3(0.0,1.0,0.0));
+    vec3 f = textureAVG(tex,vec3(0.0,0.0,1.0));
+    vec3 l = textureAVG(tex,vec3(-1.0,0.0,0.0));
+    vec3 b = textureAVG(tex,vec3(0.0,-1.0,0.0));
+    vec3 a = textureAVG(tex,vec3(0.0,0.0,-1.0));
+        
+    float kr = dot(tc,vec3(1.0,0.0,0.0)) * 0.5 + 0.5; 
+    float kt = dot(tc,vec3(0.0,1.0,0.0)) * 0.5 + 0.5;
+    float kf = dot(tc,vec3(0.0,0.0,1.0)) * 0.5 + 0.5;
+    float kl = 1.0 - kr;
+    float kb = 1.0 - kt;
+    float ka = 1.0 - kf;
+    
+    kr = somestep(kr);
+    kt = somestep(kt);
+    kf = somestep(kf);
+    kl = somestep(kl);
+    kb = somestep(kb);
+    ka = somestep(ka);    
+    
+    float d;
+    vec3 ret;
+    ret  = f * kf; d  = kf;
+    ret += a * ka; d += ka;
+    ret += l * kl; d += kl;
+    ret += r * kr; d += kr;
+    ret += t * kt; d += kt;
+    ret += b * kb; d += kb;
+    
+    return ret / d;
+}
+//--------------------------------------------------------------------------
+float G1V ( float dotNV, float k ) {
+	return 1.0 / (dotNV*(1.0 - k) + k);
+}
+//Custom BRDFGGX
+float GGX(vec3 N, vec3 V, vec3 L, float roughness, float F0) {
+    	float alpha = roughness*roughness;
+	vec3 H = normalize (V + L);
 
-vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweepFactor, float fragmentNoise) {
+	float dotNL = clamp (dot (N, L), 0.0, 1.0);
+	float dotNV = clamp (dot (N, V), 0.0, 1.0);
+	float dotNH = clamp (dot (N, H), 0.0, 1.0);
+	float dotLH = clamp (dot (L, H), 0.0, 1.0);
+
+	float D, vis;
+	float F;
+
+	// NDF : GGX
+	float alphaSqr = alpha*alpha;
+	float pi = 3.1415926535;
+	float denom = dotNH * dotNH *(alphaSqr - 1.0) + 1.0;
+	D = alphaSqr / (pi * denom * denom);
+
+	// Fresnel (Schlick)
+	float dotLH5 = pow (1.0 - dotLH, 5.0);
+	F = F0 + (1.0 - F0)*(dotLH5);
+
+	// Visibility term (G) : Smith with Schlick's approximation
+	float k = alpha / 2.0;
+	vis = G1V (dotNL, k) * G1V (dotNV, k);
+
+	return /*dotNL */ D * F * vis;
+}
+//-------------------------------------------------------------------------------
+vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweepFactor, float fragmentNoise, vec3 rayDir) {
 	// Init VRayMtl with defaults
 	VRayMtlInitParams initParams;
 	initParams.Vw = normalize(eyeDir);
@@ -2116,35 +2203,67 @@ vec3 shade(vec3 point, vec3 normal, vec3 eyeDir, float distToCamera, float sweep
 	initParams.distToCamera = distToCamera;
 	initPresetParams(initParams, sweepFactor);
 
-	// Init context and sample material
+    // fresnel
+    float metallic = 0.0;
+    float roughness = step(fract(normal.x * 2.02), 0.5/*surface*/) + 0.6;
+    float fresnel_pow = mix(5.0, 3.5,metallic);
+    float fresnel = max(1.0 - dot(normal,-rayDir), 0.0);
+    fresnel = pow(fresnel,fresnel_pow);
+    //IbL
+    vec3 ibl_diffuse = pow(vec3(texture(iChannel3,normal.xy)), vec3(2.2));
+    vec3 ibl_reflection = pow(textureBlured(iChannel0,reflect(rayDir,normal)), vec3(2.2));
+    
+    // Init context and sample material
 	VRayMtlContext ctx = initVRayMtlContext(initParams);
 	ctx.fragmentNoise = fragmentNoise;
 	vec3 lightDir = normalize(vec3(1, 1, 0.2));
 	vec3 diffuseDirect = computeDirectDiffuseContribution(initParams, ctx, lightDir);
 	vec3 diffuseIndirect = computeIndirectDiffuseContribution(initParams, ctx);
-	vec3 diffuse = diffuseDirect + diffuseIndirect;
-	vec3 reflDirect = computeDirectReflectionContribution(initParams, ctx, lightDir);
+	vec3 diffuse = /*diffuseDirect + diffuseIndirect*/pow(textureLod( iChannel3, rayDir.xy,0.0).xyz,vec3(2.2));
+
+    
+	vec3 reflDirect =  computeDirectReflectionContribution(initParams, ctx, lightDir);
 	vec3 reflIndirect = computeIndirectReflectionContribution(initParams, ctx);
-	vec3 reflection = reflDirect + reflIndirect;
+	vec3 reflection = /*reflDirect + reflIndirect*/pow(textureLod( iChannel1, rayDir,0.0).xyz ,vec3(2.2));
+    // reflection
+    reflection = mix(reflection,ibl_reflection,(1.0-fresnel)*roughness);
+    reflection = mix(reflection,ibl_reflection,roughness);
+    
+    // specular
+    vec3 light = normalize(vec3(-0.5,1.0,0.0));
+    float power = 1.0 / max(roughness * 0.4,0.01);
+    vec3 light_color = pow(texture(iChannel0,vec3(1.0,0.0,0.0)).xyz * 1.5, vec3(2.2));
+    vec3 spec = light_color * GGX(normal,-rayDir,light,roughness*0.3, 0.2);
+    reflection -= spec;
+    
+    // diffuse
+    diffuse = ibl_diffuse;
+    diffuse = mix(diffuse,reflection,fresnel);
+    
 	vec3 sheen = vec3(0.0);
 	if (ctx.hasSheen) {
-		vec3 sheenDirect = computeDirectSheenContribution(initParams, ctx, lightDir);
+		vec3 sheenDirect = computeDirectSheenContribution(initParams, ctx, diffuse);
 		vec3 sheenIndirect = computeIndirectSheenContribution(initParams, ctx);
-		sheen = sheenDirect + sheenIndirect;
+		sheen = sheenDirect + sheenIndirect/*diffuse*/;
 	}
 
 	vec3 coat = vec3(0.0);
 	if (ctx.hasCoat) {
-		vec3 coatDirect = computeDirectCoatContribution(initParams, ctx, lightDir);
+		vec3 coatDirect = computeDirectCoatContribution(initParams, ctx, diffuse);
 		vec3 coatIndirect = computeIndirectCoatContribution(initParams, ctx);
-		coat = coatDirect + coatIndirect;
+		coat = coatDirect + coatIndirect ;
 	}
 	
 	float alpha = intensity(ctx.opacity);
-	vec3 refraction = computeRefractFogContrib(initParams, ctx, diffuseDirect)
+	vec3 refraction = computeRefractFogContrib(initParams, ctx, vec3(0.0))
 		+ computeIndirectRefractionContribution(initParams, ctx, alpha, -initParams.Vw);
-
-	return diffuse * ctx.diff + reflection * ctx.refl + ctx.illum + refraction * ctx.refr + sheen * ctx.sheen + coat * ctx.coat;
+        
+    vec3 color = mix(mix(mix(mix(diffuse,reflection ,metallic),refraction*ctx.refr,metallic),sheen*ctx.sheen,metallic),coat * ctx.coat,metallic) + spec;
+    return color;
+    return pow(color, vec3(1.0/2.2));
+    
+	//return diffuse  + reflection  + refraction * ctx.refr + sheen  + coat * ctx.coat;
+    
 }
 
 
@@ -2166,11 +2285,16 @@ float raySphere(vec3 rpos, vec3 rdir, vec3 sp, float radius, inout vec3 point, i
 	return dt;
 }
 
+
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 	// simple sphere
 	float wh = min(iResolution.x, iResolution.y);
-	vec3 rayDir = normalize(vec3((fragCoord * 2.0 - iResolution.xy) / wh, -0.85));
+	vec3 rayDir = normalize(vec3((fragCoord * 2.0 - iResolution.xy) / wh, -0.85))  ;
 	rayDir = normalize(rayDir);
+    //background_ray
+    vec2 uv = fragCoord.xy / iResolution.xy;
+    vec3 reverse_rayDir = normalize(vec3((fragCoord * 2.0 - iResolution.xy) / wh, -0.85))  ;
+    reverse_rayDir = normalize(reverse_rayDir);
 	vec3 rayOrigin = vec3(0, 0, 2.25);
 	// rotate camera with time
 	float angle = iTime * 0.25;
@@ -2179,19 +2303,30 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 	mat2 camRot = mat2(ca, sa, -sa, ca);
 	rayOrigin.xz = camRot * rayOrigin.xz;
 	rayDir.xz = camRot * rayDir.xz;
+    //background_ray
+    float angle_1 = iTime * -0.25;
+	float ca_1 = cos(angle_1);
+	float sa_1 = sin(angle_1);
+    mat2 reverse_camRot = mat2(-ca_1,-sa_1,sa_1,-ca_1);
+    reverse_rayDir.xz = reverse_camRot * reverse_rayDir.xz;
+    
+    vec3 TextureColor = vec3(texture(iChannel3, uv).xyz);//贴图
+    
 	const vec3 sphereO = vec3(0.0, 0.0, 0.0);
 	const float sphereR = 1.3;
 	vec3 point;
-	vec3 normal;
+    vec2 e = vec2(0.001, 0.00);
+	vec3 normal  ;
 	float distToCamera = raySphere(rayOrigin, rayDir, sphereO, sphereR, point, normal);
 	vec3 linColor;
 	if (distToCamera < INFINITY) {
-		float sweepFactor = 1.0 - abs(dot(normal.xz, camRot[0]));
+		float sweepFactor = 1.0 - abs(dot(normal.xz, camRot[0]));//转换动画
 		// Ideally this would be blue noise, but regular hash random also works.
 		float fragmentNoise = hashRand(fragCoord + vec2(0.01, 0.023) * float(iTime));
-		linColor = shade(point, normal, rayOrigin - point, distToCamera, sweepFactor, fragmentNoise);
+		linColor = shade(point, normal, rayOrigin - point, distToCamera, sweepFactor, fragmentNoise,rayDir);
 	} else {
-		linColor = engTextureEnvMapLOD(rayDir, 0.0);
+        vec3 background = pow(textureLod(iChannel1, reverse_rayDir,0.0).xyz,vec3(2.2));//背景gamma校正
+		linColor = background;
 	}
 	fragColor = vec4(srgb_from_rgb(linColor), 1.0);
 }
